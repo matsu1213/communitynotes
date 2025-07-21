@@ -10,15 +10,20 @@ def run_xurl(cmd: List[str], verbose_if_failed: bool = False) -> Dict[str, Any]:
     """
     try:
         completed = subprocess.run(cmd, check=True, text=True, capture_output=True)
+        try:
+            return json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            print(f"[xurl] failed to parse JSON from stdout:")
+            print("── stdout ──")
+            print(completed.stdout)
+            print("── stderr ──")
+            print(completed.stderr)
+            raise
     except subprocess.CalledProcessError as exc:
-        if verbose_if_failed:
-            print(exc.stderr)
-            print(f"\n[ xurl failed with exit code {exc.returncode} ]", flush=True)
-            if exc.stdout:
-                print("── stdout ──")
-                print(exc.stdout, end="", flush=True)
-            if exc.stderr:
-                print("── stderr ──")
-                print(exc.stderr, end="", flush=True)
+        print(f"[xurl] Command failed: {' '.join(cmd)}")
+        print(f"Exit code: {exc.returncode}")
+        print("── stdout ──")
+        print(exc.stdout, end="", flush=True)
+        print("── stderr ──")
+        print(exc.stderr, end="", flush=True)
         raise
-    return json.loads(completed.stdout)
