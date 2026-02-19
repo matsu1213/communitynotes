@@ -19,6 +19,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 from . import constants as c, contributor_state, note_ratings, note_status_history, scoring_rules
 from .constants import FinalScoringArgs, ModelResult, PrescoringArgs, ScoringArgs
 from .enums import Scorers, Topics
+from .gaussian_scorer import GaussianScorer, compute_empirical_prior_df
 from .matrix_factorization.normalized_loss import NormalizedLossHyperparameters
 from .mf_core_scorer import MFCoreScorer
 from .mf_core_with_topics_scorer import MFCoreWithTopicsScorer
@@ -62,6 +63,7 @@ def _get_scorers(
   seed: Optional[int],
   pseudoraters: Optional[bool],
   useStableInitialization: bool = True,
+  final: bool = False,
 ) -> Dict[Scorers, List[Scorer]]:
   """Instantiate all Scorer objects which should be used for note ranking.
 
@@ -73,6 +75,8 @@ def _get_scorers(
     Dict[Scorers, List[Scorer]] containing instantiated Scorer objects for note ranking.
   """
   scorers: Dict[Scorers, List[Scorer]] = dict()
+  if final:
+    scorers[Scorers.GaussianScorer] = [GaussianScorer(seed=seed, threads=12)]
   scorers[Scorers.MFCoreWithTopicsScorer] = [
     MFCoreWithTopicsScorer(
       seed, pseudoraters, useStableInitialization=useStableInitialization, threads=12
@@ -399,6 +403,7 @@ def _save_dfs_to_shared_memory(
         c.createdAtMillisKey,
         c.highVolumeRaterKey,
         c.correlatedRaterKey,
+        c.ratingSourceBucketedKey,
       ]
       + c.notHelpfulTagsTSVOrder
       + c.helpfulTagsTSVOrder,
@@ -609,6 +614,7 @@ def combine_final_scorer_results(
       modelResult.scoredNotes,
       modelResult.auxiliaryNoteInfo,
     )
+
   scoredNotes = coalesce_group_model_scored_notes(scoredNotes)
   scoredNotes = coalesce_multi_group_model_scored_notes(scoredNotes)
   scoredNotes = coalesce_topic_models(scoredNotes)
@@ -705,7 +711,14 @@ def meta_score(
     assert len(scoredNotes) == len(auxiliaryNoteInfo)
     scoredNotes = scoredNotes.merge(
       auxiliaryNoteInfo[
-        [c.noteIdKey, c.currentLabelKey] + c.helpfulTagsTSVOrder + c.notHelpfulTagsTSVOrder
+        [
+          c.noteIdKey,
+          c.currentLabelKey,
+          c.coreNegFactorPopulationSampledRatingCountKey,
+          c.corePosFactorPopulationSampledRatingCountKey,
+        ]
+        + c.helpfulTagsTSVOrder
+        + c.notHelpfulTagsTSVOrder
       ],
       on=c.noteIdKey,
     )
@@ -823,6 +836,16 @@ def meta_score(
           nmrScoringGroup,
         )
       )
+    if enabledScorers is None or Scorers.GaussianScorer in enabledScorers:
+      rules.append(
+        scoring_rules.ApplyCoverageModelResult(
+          RuleID.GAUSSIAN_MODEL,
+          {RuleID.EXPANSION_MODEL, RuleID.CORE_MODEL},
+          c.gaussianRatingStatusKey,
+          checkFirmReject=True,
+          crnhCoverage=True,
+        )
+      )
     if enabledScorers is None or Scorers.MFTopicScorer in enabledScorers:
       for topic in Topics:
         if topic == Topics.Unassigned:
@@ -830,17 +853,36 @@ def meta_score(
         rules.append(
           scoring_rules.ApplyTopicModelResult(
             RuleID[f"TOPIC_MODEL_{topic.value}"],
-            {RuleID.EXPANSION_PLUS_MODEL, RuleID.EXPANSION_MODEL, RuleID.CORE_MODEL},
+            {
+              RuleID.EXPANSION_PLUS_MODEL,
+              RuleID.EXPANSION_MODEL,
+              RuleID.CORE_MODEL,
+              RuleID.GAUSSIAN_MODEL,
+            },
             topic,
           )
         )
+
+    rules.append(
+      scoring_rules.PopulationSampledIntercept(
+        RuleID.POPULATION_SAMPLED_INTERCEPT,
+        {RuleID.CORE_MODEL},
+        c.needsMoreRatings,
+        minPopulationSampledRatings=8,
+        maxNoteInterceptThreshold=0.30,
+        divergenceThreshold=0.15,
+        minPerSignPopulationSampledRatings=2,
+      )
+    )
+
     if enableNmrDueToMinStableCrhTime:
       rules.append(
         scoring_rules.NmrDueToMinStableCrhTime(
           RuleID.NMR_DUE_TO_MIN_STABLE_CRH_TIME,
-          {RuleID.CORE_MODEL},
+          {RuleID.CORE_MODEL, RuleID.GAUSSIAN_MODEL},
         )
       )
+
     rules.extend(
       [
         scoring_rules.ScoringDriftGuard(
@@ -946,6 +988,7 @@ def _compute_note_stats(
       c.createdAtMillisKey,
       c.numRatingsLast28DaysKey,
       c.currentLabelKey,
+      c.numPopulationSampledRatingsKey,
     ]
     + (c.helpfulTagsTSVOrder + c.notHelpfulTagsTSVOrder)
   ]
@@ -1166,12 +1209,14 @@ def run_prescoring(
   checkFlips: bool = True,
   enableNmrDueToMinStableCrhTime: bool = True,
   previousRatingCutoffTimestampMillis: Optional[int] = None,
+  maxWorkers: Optional[int] = None,
 ) -> Tuple[
   pd.DataFrame,
   pd.DataFrame,
   sklearn.pipeline.Pipeline,
   PFlipPlusModel,
   c.PrescoringMetaOutput,
+  pd.DataFrame,
   pd.DataFrame,
 ]:
   logger.info("logging environment variables")
@@ -1251,7 +1296,7 @@ def run_prescoring(
     # Restrict parallelism to 6 processes.  Memory usage scales linearly with the number of
     # processes and 6 is enough that the limiting factor continues to be the longest running
     # scorer (i.e. we would not finish faster with >6 worker processes.)
-    maxWorkers=6,
+    maxWorkers=maxWorkers or 6,
   )
   (
     prescoringNoteModelOutput,
@@ -1304,6 +1349,50 @@ def run_prescoring(
     pflipPlusModel = PFlipPlusModel(seed=seed)
     pflipPlusModel.fit(notes, ratings, noteStatusHistory, prescoringRaterModelOutput)
 
+  with c.time_block("Computing empirical prior."):
+    currentTime = time.time()
+    priorNotes = notes[
+      notes[c.createdAtMillisKey]
+      >= (pd.to_datetime(currentTime, unit="s") - pd.DateOffset(years=1)).value / 1e6
+    ]
+    priorRatings = ratings[ratings[c.noteIdKey].isin(priorNotes[c.noteIdKey])]
+    ratingCounts = (
+      priorRatings[[c.noteIdKey, c.raterParticipantIdKey]].groupby(c.noteIdKey).agg("count")
+    )
+    logger.info(f"total num notes {ratingCounts.shape[0]}")
+    ratingCounts = ratingCounts.loc[
+      (ratingCounts[c.raterParticipantIdKey] > 20) & (ratingCounts[c.raterParticipantIdKey] < 100)
+    ]
+    logger.info(f"notes w correct num ratings {ratingCounts.shape[0]}")
+    logger.info(f"num ratings before merge {priorRatings.shape[0]}")
+    priorRatings = priorRatings.loc[priorRatings[c.noteIdKey].isin(ratingCounts.index.values)]
+    logger.info(f"preprocessing {priorRatings.shape[0]} ratings")
+    priorNotes, priorRatings, _ = preprocess_data(priorNotes, priorRatings, noteStatusHistory)
+    corePrescoringRaterModelOutput = prescoringRaterModelOutput[
+      prescoringRaterModelOutput[c.scorerNameKey] == "MFCoreScorer"
+    ]
+    priorRatings = priorRatings.merge(corePrescoringRaterModelOutput[[c.raterParticipantIdKey]])
+    # Also remove ratings from users with PSS
+    priorRatings = apply_post_selection_similarity(
+      priorNotes,
+      priorRatings,
+      prescoringRaterModelOutput[
+        [c.raterParticipantIdKey, c.postSelectionValueKey, c.quasiCliqueValueKey]
+      ].dropna(),
+    )
+    logger.info(f"recent core ratings for empirical prior {len(priorRatings)}")
+    priorRatings[c.raterParticipantIdKey] = priorRatings[c.raterParticipantIdKey].astype(str)
+    priorRatings = (
+      priorRatings[[c.noteIdKey, c.raterParticipantIdKey, c.helpfulNumKey]]
+      .merge(
+        prescoringRaterModelOutput[[c.raterParticipantIdKey, c.internalRaterFactor1Key]],
+        on=c.raterParticipantIdKey,
+      )
+      .dropna()
+    )
+
+    empiricalTotals = compute_empirical_prior_df(priorRatings)
+
   # Prescoring itself is now done. We will not run final_note_scoring to check note status flips.
   if checkFlips:
     # Rescore a smaller set of notes, since we are only using these note statuses to check for flips.
@@ -1335,6 +1424,7 @@ def run_prescoring(
       checkFlips=checkFlips,
       enableNmrDueToMinStableCrhTime=enableNmrDueToMinStableCrhTime,
       previousRatingCutoffTimestampMillis=previousRatingCutoffTimestampMillis,
+      empiricalTotals=empiricalTotals,
     )
   else:
     scoredNotes = None
@@ -1346,6 +1436,7 @@ def run_prescoring(
     pflipPlusModel,
     prescoringMetaOutput,
     scoredNotes,
+    empiricalTotals,
   )
 
 
@@ -1599,6 +1690,8 @@ def run_final_note_scoring(
   previousAuxiliaryNoteInfo: Optional[pd.DataFrame] = None,
   previousRatingCutoffTimestampMillis: Optional[int] = 0,
   enableNmrDueToMinStableCrhTime: bool = True,
+  maxWorkers: Optional[int] = None,
+  empiricalTotals: Optional[pd.DataFrame] = None,
 ):
   metrics = {}
   with c.time_block("Logging Final Scoring RAM usage"):
@@ -1758,13 +1851,16 @@ def run_final_note_scoring(
     )
     logger.info(f"Post Selection Similarity Final Scoring: {len(ratings)} ratings remaining.")
 
-  scorers = _get_scorers(seed, pseudoraters, useStableInitialization=useStableInitialization)
+  # run with final = True to get Gaussian Scorer
+  scorers = _get_scorers(
+    seed, pseudoraters, useStableInitialization=useStableInitialization, final=True
+  )
 
   # Restrict parallelism to 6 processes.  Memory usage scales linearly with the number of
   # processes and 6 is enough that the limiting factor continues to be the longest running
   # scorer (i.e. we would not finish faster with >6 worker processes.).  Note that only
   # system tests run with full scale data and previousScoredNotes=None.
-  maxWorkers = 4 if previousScoredNotes is None else 6
+  maxWorkers = maxWorkers or (4 if previousScoredNotes is None else 6)
   logger.info(f"Number of concurrent scoring workers: {maxWorkers}")
   modelResults = _run_scorers(
     args,
@@ -1777,6 +1873,7 @@ def run_final_note_scoring(
       prescoringNoteModelOutput=prescoringNoteModelOutput,
       prescoringRaterModelOutput=prescoringRaterModelOutput,
       prescoringMetaOutput=prescoringMetaOutput,
+      empiricalTotals=empiricalTotals,
     ),
     runParallel=runParallel,
     dataLoader=dataLoader,
@@ -1784,6 +1881,17 @@ def run_final_note_scoring(
   )
 
   scoredNotes, auxiliaryNoteInfo = combine_final_scorer_results(modelResults, noteStatusHistory)
+
+  # Fill NaN values in core population sampled columns after merging all scorer results
+  population_sampled_rating_count_cols = [
+    c.coreNegFactorPopulationSampledRatingCountKey,
+    c.corePosFactorPopulationSampledRatingCountKey,
+  ]
+
+  for col in population_sampled_rating_count_cols:
+    if col in auxiliaryNoteInfo.columns:
+      auxiliaryNoteInfo[col] = auxiliaryNoteInfo[col].fillna(0).astype(np.int64)
+
   scoredNotes = scoredNotes.merge(pflipPredictions, how="left")
   scoredNotes, newNoteStatusHistory, auxiliaryNoteInfo = post_note_scoring(
     scorers,
@@ -1924,6 +2032,7 @@ def post_note_scoring(
     scoredNotes[c.timestampMillisOfNmrDueToMinStableCrhTimeKey] = newNoteStatusHistory[
       c.timestampMillisOfNmrDueToMinStableCrhTimeKey
     ]
+
     scoredNotes = _add_deprecated_columns(scoredNotes)
     scoredNotes = scoredNotes.drop(columns=PFLIP_LABEL)
     if strictColumns:
@@ -1960,6 +2069,7 @@ def run_scoring(
         sklearn.pipeline.Pipeline,
         sklearn.pipeline.Pipeline,
         c.PrescoringMetaOutput,
+        Optional[pd.DataFrame],
         Optional[pd.DataFrame],
       ],
       None,
@@ -2027,6 +2137,7 @@ def run_scoring(
     prescoringPflipClassifier,
     prescoringMetaOutput,
     prescoringScoredNotes,
+    empiricalTotals,
   ) = run_prescoring(
     args,
     notes=prescoringNotesInput,
@@ -2053,6 +2164,7 @@ def run_scoring(
         prescoringPflipClassifier,
         prescoringMetaOutput,
         prescoringScoredNotes,
+        empiricalTotals,
       )
   logger.info("Starting final scoring")
 
@@ -2078,6 +2190,7 @@ def run_scoring(
     previousScoredNotes=previousScoredNotes,
     previousAuxiliaryNoteInfo=previousAuxiliaryNoteInfo,
     previousRatingCutoffTimestampMillis=previousRatingCutoffTimestampMillis,
+    empiricalTotals=empiricalTotals,
   )
 
   logger.info("Starting contributor scoring")

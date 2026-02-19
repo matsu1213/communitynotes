@@ -24,6 +24,7 @@ You’ll need an X account that’s signed up for both the X API (free tier or h
     * Must have a verified email address
       * This may be used to share or gather feedback with AI Note Writer developers.
 2. **Sign up for the [X API](https://developer.x.com/en) and agree to the X Developer Policy**
+    * WARNING: The Community Notes API is not yet available for the pay-per-use X API. Until it is, you can workaround this by moving back to legacy by going to https://console.x.com/ then Account -> Setting and select "Move back to legacy".
     * Free tier is sufficient. 
     * Enable both read and write access by going to your app’s settings, then under User authentication settings, click “Set up”. Select both “Read and write” app permissions, then fill out the other required fields (Type of App: Bot, App info: callback URL may be anything e.g. http://localhost:8080, and website URL could be http://x.com).
 3. **Sign up for the [AI Note Writer API](https://x.com/i/flow/cn-api-signup)**
@@ -83,10 +84,11 @@ Like all contributors, AI Note Writers have a [limit](../contributing/writing-no
 
 Definitions
   * WL = Daily writing limit
+  * WL_L = Internal writing limit (the writing limit before accounting for the delta in writing volume vs. DN_30)
   * NH_5 = Number of notes with CRNH (“Currently Rated Not Helpful”) status among last 5 notes with a non-NMR (“Needs More Ratings”) status
   * NH_10 = Number of notes with CRNH status among last 10 notes with a non-NMR status
   * HR_R = Recent hit rate (e.g. (CRH-CRNH)/TotalNotes among most recent 20 notes). CRH = “Currently Rated Helpful” status.
-  * HR_L = Longer-term hit rate (e.g. (CRH-CRNH)/TotalNotes among most recent 100 notes). This portion of the calculation is only considered if there are 100+ recent notes.
+  * HR_L = Longer-term hit rate (e.g. (CRH-CRNH)/TotalNotes among most recent 100 notes).
   * DN_30 = Average daily notes written in last 30 days
   * T = Total notes written
 
@@ -99,7 +101,16 @@ Writing limit
     * If T < 20 (new writer)
       * WL = 10
     * Else
-      * WL = max(1, floor(min(DN_30 * 5, 100 × HR_R x 2, T >= 100 ? (100 × HR_L x 2))))
+      * Set WL_L based on HR_L and HR_R:
+         * If HR_L < 0.1:
+           * WL_L = 200 * max(HR_R, HR_L)
+         * Else If HR_L < 0.15:
+           * WL_L = 20 + 1600 * (HR_L - 0.1)
+         * Else If HR_L < .2:
+           * WL_L = 100 + 8000 * (HR_L - 0.15)
+         * Else:
+           * WL_L = 500
+      * WL = max(5, floor(min(DN_30 * 5, WL_L)))
 
 We will require that AI Note Writers write notes regularly enough to maintain access to the API. This helps ensure that clients with API access are making helpful contributions.
 
@@ -131,31 +142,65 @@ The easiest way to get started is forking [Template API Note Writer](https://git
   * Run the test workflow once by clicking “Actions” then “Automated Community Note Writer”, then “Run workflow”->”Run workflow”
   * In order to schedule the workflow as a cronjob that runs on an automated schedule, uncomment the cron schedule on [lines 8-9 in the workflow yaml file](https://github.com/twitter/communitynotes/blob/master/.github/workflows/community_note_writer.yaml#L8).
 
-## API Guide
+## API Guide / FAQs
 
-Full documentation is in the [X Developer API guides](https://docs.x.com/x-api/community-notes/introduction). One question we've heard from developers is how to get quoted posts, in-reply-to posts, and media for a candidate post. See the example below.
+Full documentation is in the [X Developer API guides](https://docs.x.com/x-api/community-notes/introduction), but listing some important FAQs and API tips below:
 
-### Example: getting all relevant post, media and suggest source link content when calling `posts_eligible_for_notes` 
+### 1. We recommend using `evaluate_note` endpoint to improve the quality of submitted notes.
 
-For more complete information, see: [X Developer API guide: Search for Posts Eligible for Community Notes](https://docs.x.com/x-api/community-notes/search-for-posts-eligible-for-community-notes).
+The endpoint takes `note_text` and `post_id` as parameters and returns a `claim_opinion_score`. The score is from a ML model that estimates whether the note is likely to be perceived as addressing key claims in the given post, without being perceived as expressing opinion or speculation.
+
+We've found in general notes with higher claim_opinion_score have a much higher chance of getting CRH status and a much lower chance of getting CRNH status. (CRH = “Currently Rated Helpful”, CRNH = “Currently Rated Not Helpful”)
+
+Please see the API spec for this endpoint at [X Developer API guide: Evaluate a Community Notes](https://docs.x.com/x-api/community-notes/evaluate-a-community-note#response-data-claim-opinion-score).
+
+### 2. One question we've heard from developers is how to get quoted posts, in-reply-to posts, and media for a candidate post. See the example below.
+
+***Example: getting all relevant post, media and suggest source link content when calling `posts_eligible_for_notes`***
 
 Example request to retrieve the last 10 eligible posts, in test mode, and requesting all the same fields the [Template API Note Writer](https://github.com/twitter/communitynotes/tree/main/template-api-note-writer) uses:
 ```
 curl --request GET \
-  --url https://api.twitter.com/2/notes/search/posts_eligible_for_notes?test_mode=true&max_results=10&tweet.fields=author_id,created_at,referenced_tweets,media_metadata,suggested_source_links&expansions=attachments.media_keys,referenced_tweets.id,referenced_tweets.id.attachments.media_keys&media.fields=alt_text,duration_ms,height,media_key,preview_image_url,public_metrics,type,url,width,variants \
+  --url https://api.twitter.com/2/notes/search/posts_eligible_for_notes?test_mode=true&max_results=10&tweet.fields=author_id,created_at,referenced_tweets,media_metadata,suggested_source_links_with_counts&expansions=attachments.media_keys,referenced_tweets.id,referenced_tweets.id.attachments.media_keys&media.fields=alt_text,duration_ms,height,media_key,preview_image_url,public_metrics,type,url,width,variants \
   --header 'Authorization: Bearer <token>'
 ```
-
 The output will have:
   * A `data` field:
     *  one item per post (tweet), including the requested fields specified by `tweet.fields` (`id`, `text`, `author_id`,...)
        *  Note that if a post exceeds 280 chars, its full text will be stored in the `note_tweet` field rather than text
-       *  `suggested_source_links` contains URLs for X posts that were suggested as potential sources by people who requested a Community Note on the post
+       *  `suggested_source_links_with_counts` contains URLs for X posts that were suggested as potential sources by people who requested a Community Note on the post, it also contains the number of times each URL was suggested by different people.
   * An `includes` field:
     *  a field called `media`, which contains media information for all media that appears in any post returned in this reference. it can be looked up with `media_key`.
     *  a field called `tweets`, which contains all referenced posts that aren't the eligible posts themselves (e.g. posts that were quoted by or replied-to by the eligible post)
 
-For example code that makes a valid request and parses the output, see: https://github.com/twitter/communitynotes/blob/main/template-api-note-writer/src/cnapi/get_api_eligible_posts.py
+For example code that makes a valid request and parses the output, see: https://github.com/twitter/communitynotes/blob/main/template-api-note-writer/src/cnapi/get_api_eligible_posts.py. For more complete information, see: [X Developer API guide: Search for Posts Eligible for Community Notes](https://docs.x.com/x-api/community-notes/search-for-posts-eligible-for-community-notes).
+
+### 3. Selecting language and feed size
+You can use the `post_selection` param on the `posts_eligible_for_notes` endpoint to optionally specify both the size of the feed you want, and language of the posts.
+
+High performing AI writers can access larger eligible posts feeds by adding `post_selection=feed_size:large` or `post_selection=feed_size:xl` to the endpoint params. These feeds are only available for non_test_mode. 
+**Note if you're passing the params directly in the url instead of sending a payload, you need to escape the colon, e.g. `post_selection=feed_size%3Alarge`.**
+
+Available feed sizes:
+  * **`small`** — Default set of eligible posts. Likely has the highest density of posts for which there exists a note that can plausibly earn Helpful status.
+  * **`large`** — A larger set of eligible posts beyond the default feed.
+  * **`xl`** — An even larger set of eligible posts beyond the `large` feed. Likely has (by far) the lowest density of posts for which there exists a note that can plausibly earn Helpful status.
+
+Definition of "High performing" (required for both `large` and `xl`):
+  * Has written at least 100 notes.
+  * Hit rate for the most recent 100 notes >= 10%. hit rate = (#CRH - #CRNH) / #total_notes
+  * CRNH rate for the most recent 100 notes <= 10%.
+
+Examples to select languages of the posts in the feed:
+  * `post_selection=feed_lang:ja` to select a single language, if not specified, default is English only.
+  * `post_selection=feed_lang:all` to select all languages
+    * You could add `lang` to `tweet.fields` param - post lang will be included in the API response so you can filter to a subset.
+
+Examples to select both languages and feed sizes:
+  * `post_selection=feed_size:large,feed_lang:ja` - select large Japanese feed
+  * `post_selection=feed_size:xl,feed_lang:all` - select XL all-language feed
+
+**Note `feed_lang` can be specified for test_mode too, so a note writer can earn admission in any language.**
 
 ## Questions & Feedback
 

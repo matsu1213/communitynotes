@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from enum import Enum
+import hashlib
 import logging
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -42,6 +43,7 @@ class RuleID(Enum):
   RATER_BALANCE = RuleAndVersion("RaterBalance", "1.0", False)
   NO_HIGH_VOL_INTERCEPT = RuleAndVersion("NoHighVolIntercept", "1.0", False)
   NO_CORRELATED_INTERCEPT = RuleAndVersion("NoCorrelatedIntercept", "1.0", False)
+  POPULATION_SAMPLED_INTERCEPT = RuleAndVersion("PopulationSampledIntercept", "1.0", False)
 
   # Rules used in _meta_score.
   META_INITIAL_NMR = RuleAndVersion("MetaInitialNMR", "1.0", False)
@@ -74,6 +76,7 @@ class RuleID(Enum):
   INSUFFICIENT_EXPLANATION = RuleAndVersion("InsufficientExplanation", "1.0", True)
   SCORING_DRIFT_GUARD = RuleAndVersion("ScoringDriftGuard", "1.0", False)
   NMR_DUE_TO_MIN_STABLE_CRH_TIME = RuleAndVersion("NmrDueToMinStableCrhTime", "1.0", False)
+  GAUSSIAN_MODEL = RuleAndVersion("GaussianModel", "1.0", True)
 
   def get_name(self) -> str:
     """Returns a string combining the name and version to uniquely name the logic of the ScoringRule."""
@@ -601,6 +604,118 @@ class NoCorrelatedIntercept(ScoringRule):
     return (noteStatusUpdates, None)
 
 
+class PopulationSampledIntercept(ScoringRule):
+  def __init__(
+    self,
+    ruleID: RuleID,
+    dependencies: Set[RuleID],
+    status: str,
+    minPopulationSampledRatings: int,
+    maxNoteInterceptThreshold: float = 0.30,
+    divergenceThreshold: float = 0.15,
+    minPerSignPopulationSampledRatings: int = 2,
+  ):
+    """Block CRH when population sampled intercept diverges significantly from regular intercept.
+
+    This rule prevents notes from achieving CRH status when there's significant
+    disagreement between all raters and population sampled raters, indicating
+    potential manipulation. This rule is currently limited to only  core
+    model results.
+
+    Args:
+      ruleID: enum corresponding to rule name and version
+      dependencies: Rules which must run before this rule
+      status: the status which each note should be set to when they diverge (e.g. NMR)
+      minPopulationSampledRatings: minimum number of ratings in population sampled to apply this rule
+      divergenceThreshold: minimum difference between intercepts to block a note from going CRH
+      crhThreshold: minimum intercept for notes to generally achieve CRH status
+    """
+    super().__init__(ruleID, dependencies)
+    self._status = status
+    self._minPopulationSampledRatings = minPopulationSampledRatings
+    self._divergenceThreshold = divergenceThreshold
+    self._maxNoteInterceptThreshold = maxNoteInterceptThreshold
+    self._minPerSignPopulationSampledRatings = minPerSignPopulationSampledRatings
+
+  def score_notes(
+    self, noteStats: pd.DataFrame, currentLabels: pd.DataFrame, statusColumn: str
+  ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+    """Block notes from CRH when population sampled intercept diverges from main intercept."""
+    # Check if this rule applies by looking for core-specific population sampled column
+    if c.coreNoteInterceptPopulationSampledKey not in noteStats.columns:
+      logger.info(
+        f"PopulationSampledIntercept rule skipped: {c.coreNoteInterceptPopulationSampledKey} column not present (not enough core model context)"
+      )
+      # Return empty updates - rule doesn't apply in this context
+      return (pd.DataFrame({c.noteIdKey: [], statusColumn: []}), None)
+
+    # Require per-sign population sampled counts from core model
+    if not (
+      (c.coreNegFactorPopulationSampledRatingCountKey in noteStats.columns)
+      and (c.corePosFactorPopulationSampledRatingCountKey in noteStats.columns)
+    ):
+      logger.info(
+        "PopulationSampledIntercept rule skipped: core per-sign population sampled rating counts not present"
+      )
+      return (pd.DataFrame({c.noteIdKey: [], statusColumn: []}), None)
+
+    # Only apply to notes on track for CRH
+    candidateNotes = currentLabels[currentLabels[statusColumn] == c.currentlyRatedHelpful][
+      [c.noteIdKey]
+    ]
+    noteStats = noteStats.merge(candidateNotes, on=c.noteIdKey, how="inner")
+
+    # Only consider notes with both core and population sampled intercepts available and have enough population sampled ratings
+    before_filter = len(noteStats)
+    noteStats = noteStats.dropna(
+      subset=[c.coreNoteInterceptKey, c.coreNoteInterceptPopulationSampledKey]
+    )
+
+    noteStats = noteStats.copy()
+    noteStats["totalPopulationSampledRatings"] = (
+      noteStats[c.coreNegFactorPopulationSampledRatingCountKey]
+      + noteStats[c.corePosFactorPopulationSampledRatingCountKey]
+    )
+    noteStats = noteStats[
+      noteStats["totalPopulationSampledRatings"] >= self._minPopulationSampledRatings
+    ]
+
+    noteStats = noteStats[
+      (
+        noteStats[c.coreNegFactorPopulationSampledRatingCountKey]
+        >= self._minPerSignPopulationSampledRatings
+      )
+      & (
+        noteStats[c.corePosFactorPopulationSampledRatingCountKey]
+        >= self._minPerSignPopulationSampledRatings
+      )
+    ]
+    after_filter = len(noteStats)
+
+    logger.info(
+      f"Population sampled divergence check: {after_filter}/{before_filter} notes have both core and population sampled intercepts"
+    )
+
+    # Compare the core intercept with the core population sampled intercept
+    noteStats["populationSampledInterceptDiff"] = (
+      noteStats[c.coreNoteInterceptKey] - noteStats[c.coreNoteInterceptPopulationSampledKey]
+    )
+
+    # Identify notes where the population sampled intercept is below the max note intercept threshold
+    # and also diverges from the core intercept by at least the divergence threshold.
+    notesWithLowPopulationSampledIntercept = noteStats.loc[
+      (noteStats[c.coreNoteInterceptPopulationSampledKey] < self._maxNoteInterceptThreshold)
+      & (noteStats["populationSampledInterceptDiff"] >= self._divergenceThreshold)
+    ]
+
+    noteStatusUpdates = notesWithLowPopulationSampledIntercept[[c.noteIdKey]].copy()
+
+    logger.info(f"Notes blocked due to low population sampled intercept: {len(noteStatusUpdates)}")
+    noteStatusUpdates[statusColumn] = self._status
+
+    return (noteStatusUpdates, None)
+
+
 class RequireRaterBalance(ScoringRule):
   def __init__(
     self,
@@ -662,8 +777,10 @@ class NmrDueToMinStableCrhTime(ScoringRule):
     ruleID: RuleID,
     dependencies: Set[RuleID],
     requiredStableCrhMinutesThreshold: int = 30,
-    maxStableCrhMinutesThreshold: int = 180,
     maxNyhMinutesThreshold: int = 360,
+    # maxStableCrhMinutesThreshold: int = 150, # TODO: set this after A/B test resolved
+    maxStableCrhMinutesThresholdABHighEvenBucket=120,  # TODO: delete after A/B test resolved
+    maxStableCrhMinutesThresholdABLowOddBucket=60,  # TODO: delete after A/B test resolved
   ):
     """
     Args:
@@ -676,8 +793,12 @@ class NmrDueToMinStableCrhTime(ScoringRule):
     """
     super().__init__(ruleID, dependencies)
     self.requiredStableCrhMinutesThreshold = requiredStableCrhMinutesThreshold
-    self.maxStableCrhMinutesThreshold = maxStableCrhMinutesThreshold
     self.maxNyhMinutesThreshold = maxNyhMinutesThreshold
+
+    # TODO: started A/B test for max stable CRH minutes Feb 13, 2026. Once analyzed, revert to fixed value.
+    # self.maxStableCrhMinutesThreshold = maxStableCrhMinutesThreshold
+    self.maxStableCrhMinutesThresholdABHighEvenBucket = maxStableCrhMinutesThresholdABHighEvenBucket
+    self.maxStableCrhMinutesThresholdABLowOddBucket = maxStableCrhMinutesThresholdABLowOddBucket
 
   def score_notes(
     self, noteStats: pd.DataFrame, currentLabels: pd.DataFrame, statusColumn: str
@@ -792,12 +913,31 @@ class NmrDueToMinStableCrhTime(ScoringRule):
     notesAlreadyInStabilization = (
       noteStatusUpdates[c.timestampMillisOfNmrDueToMinStableCrhTimeKey] > 0
     )
+
+    # Set max stabilization period based on A/B test. TODO: cleanup when A/B test cleaned up.
+    # Bucketing uses MD5 hash of noteId for unbiased 50/50 split:
+    #   - Bucket 0 (first hex char is even: 0,2,4,6,8,A,C,E): high threshold (120 min)
+    #   - Bucket 1 (first hex char is odd: 1,3,5,7,9,B,D,F): low threshold (60 min)
+    maxStableCrhMinutesThresholdKey = "maxStableCrhMinutesThreshold"
+
+    def _get_ab_test_bucket(noteId: int) -> int:
+      """Get A/B test bucket (0 or 1) using MD5 hash of noteId."""
+      return int(hashlib.md5(str(int(noteId)).encode()).hexdigest()[0], 16) % 2
+
+    noteStatusUpdates[maxStableCrhMinutesThresholdKey] = noteStatusUpdates[c.noteIdKey].apply(
+      lambda noteId: self.maxStableCrhMinutesThresholdABHighEvenBucket
+      if _get_ab_test_bucket(noteId) == 0
+      else self.maxStableCrhMinutesThresholdABLowOddBucket
+    )
+
     # (1)-(C)-(a): Exit stabilization period to CRH if the note has been in the period for
     # longer than maxStableCrhMinutesThreshold and the note is currently scored CRH.
     inStabilizationLongerThanCrhMax = (
       c.epochMillis - noteStatusUpdates[c.timestampMillisOfNmrDueToMinStableCrhTimeKey]
-      > self.maxStableCrhMinutesThreshold * 60 * 1000
+      > noteStatusUpdates[maxStableCrhMinutesThresholdKey] * 60 * 1000
     )
+    # Drop temporary A/B test column before merge to avoid type conversion issues
+    noteStatusUpdates = noteStatusUpdates.drop(columns=[maxStableCrhMinutesThresholdKey])
 
     noteStatusUpdates.loc[
       notesGoingCrh & notesAlreadyInStabilization & inStabilizationLongerThanCrhMax,
@@ -1136,6 +1276,116 @@ class ApplyNMRGroupModelResult(ScoringRule):
 
     # Set note status and return
     noteStatusUpdates[statusColumn] = c.needsMoreRatings
+
+    return (noteStatusUpdates, None)
+
+
+class ApplyCoverageModelResult(ScoringRule):
+  def __init__(
+    self,
+    ruleID: RuleID,
+    dependencies: Set[RuleID],
+    sourceColumn: str,
+    checkFirmReject: bool = False,
+    minSafeguardThreshold: Optional[float] = None,
+    crnhCoverage: bool = False,
+  ):
+    """Set the note status from sourceColumn when status is CRH and note is not already CRH
+    and note is not firm reject or CRNH in core/expansion
+
+    Args:
+      rule: enum corresponding to a namedtuple defining a rule name and version string for the ScoringRule.
+      dependencies: Rules which must run before this rule can run.
+      sourceColumn: column containing note status (CRH, CRNH, NMR) to propagate to output,
+    """
+    super().__init__(ruleID, dependencies)
+    self._sourceColumn = sourceColumn
+    self._checkFirmReject = checkFirmReject
+    self._minSafeguardThreshold = minSafeguardThreshold
+    self._crnhCoverage = crnhCoverage
+
+  def score_notes(
+    self, noteStats: pd.DataFrame, currentLabels: pd.DataFrame, statusColumn: str
+  ) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+    """Flip notes from NMR to CRH based on source models and subject to core/expansion model safeguards."""
+
+    # Generate the set of note status updates
+    probationaryCRHOrNYHNotes = noteStats[
+      (noteStats[self._sourceColumn].isin({c.currentlyRatedHelpful, c.needsYourHelp}))
+    ][[c.noteIdKey, self._sourceColumn]]
+
+    # Identify notes blocked from CRH status due to FR/CRNH status in core or expansion
+    if self._checkFirmReject:
+      coreRejects = noteStats[c.coreRatingStatusKey].isin(
+        {c.firmReject, c.currentlyRatedNotHelpful}
+      )
+      expansionRejects = noteStats[c.expansionRatingStatusKey].isin(
+        {c.firmReject, c.currentlyRatedNotHelpful}
+      )
+      blockedNotes = coreRejects | (noteStats[c.coreRatingStatusKey].isna() & expansionRejects)
+      actionableNotes = noteStats[~blockedNotes][[c.noteIdKey]]
+      probationaryCRHOrNYHNotes = probationaryCRHOrNYHNotes.merge(
+        actionableNotes, on=c.noteIdKey, how="inner"
+      )
+
+    if self._minSafeguardThreshold is not None:
+      # If necessary, identify notes which pass score bound checks for expansion and core models.
+
+      noteStats = noteStats[
+        [c.noteIdKey, c.coreNoteInterceptKey, c.expansionNoteInterceptKey]
+      ].copy()
+      noteStats["core"] = noteStats[c.coreNoteInterceptKey] > self._minSafeguardThreshold
+
+      noteStats.loc[noteStats[c.coreNoteInterceptKey].isna(), "core"] = np.nan
+      noteStats["expansion"] = noteStats[c.expansionNoteInterceptKey] > self._minSafeguardThreshold
+
+      noteStats.loc[noteStats[c.expansionNoteInterceptKey].isna(), "expansion"] = np.nan
+
+      # Prioritize core over expansion intercepts when available
+      def _get_value(row):
+        idx = row.first_valid_index()
+        # If either core or expansion had an intercept then return whether it was in the valid
+        # range.  If neither had an intercept, return False.  Preference is given to core due
+        # to the ordering when selecting columns from noteStats below.
+        if idx is None:
+          return False
+        elif row[idx] == 1.0:
+          return True
+        elif row[idx] == 0.0:
+          return False
+        else:
+          assert False, f"unexpected value: {row[idx]}"
+
+      with c.time_block("Get value apply for source model"):
+        noteStats["actionable"] = noteStats[["core", "expansion"]].apply(_get_value, axis=1)
+
+      # Filter set of note status updates to only include actionable notes
+      actionableNotes = noteStats[noteStats["actionable"]][[c.noteIdKey]]
+      probationaryCRHOrNYHNotes = probationaryCRHOrNYHNotes.merge(
+        actionableNotes, on=c.noteIdKey, how="inner"
+      )
+
+    if self._crnhCoverage:
+      probationaryCRNHNotes = noteStats[
+        (noteStats[self._sourceColumn].isin({c.currentlyRatedNotHelpful}))
+      ][[c.noteIdKey, self._sourceColumn]]
+      probationaryUpdates = pd.concat([probationaryCRHOrNYHNotes, probationaryCRNHNotes])
+    else:
+      probationaryUpdates = probationaryCRHOrNYHNotes
+    # Identify notes which are currently NMR or NYH.
+    currentNMROrNYHNotes = currentLabels[
+      currentLabels[statusColumn].isin({c.needsMoreRatings, c.needsYourHelp})
+    ][[c.noteIdKey, statusColumn]]
+    # Identify candidate note status updates.  This requires pruning to notes that have a NMR->NYH, NMR->CRH
+    # or NYH->CRH transition - in other words dropping NYH->NYH transitions.
+    noteStatusUpdates = probationaryUpdates.merge(currentNMROrNYHNotes, on=c.noteIdKey, how="inner")
+    noteStatusUpdates = noteStatusUpdates[
+      (noteStatusUpdates[self._sourceColumn] != c.needsYourHelp)
+      | (noteStatusUpdates[statusColumn] != c.needsYourHelp)
+    ][[c.noteIdKey, self._sourceColumn]]
+
+    # Set note status and return
+    noteStatusUpdates = noteStatusUpdates.rename(columns={self._sourceColumn: statusColumn})
 
     return (noteStatusUpdates, None)
 

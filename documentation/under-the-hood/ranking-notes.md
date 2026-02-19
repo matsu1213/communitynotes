@@ -163,10 +163,23 @@ The model uses logistic regression to predict note status outcomes.
 The feature vectorization process involves both discretization and feature crosses, yielding a sparse representation and allowing the model to learn non-linear relationships.
 The model is calibrated to delay Helpful status for no more than 60% of notes that ultimately stabilize to Helpful status.
 
+**Population Sample Filtering**
+
+In general, it's very useful for contributors to be able to rate whatever notes they are interested in rating, and the scoring algorithm described on this page is designed to be robust to notes that get more ratings from contributors with one viewpoint than another. But in the event that ratings from users who self-selected whether to rate a particular note disagree substantially with ratings from users who were randomly sampled from the population (in that they were responding to randomly-sent notifications requesting their help to rate a particular note), then the ratings from the random population sample can override the self-selected raters.
+
+Each rating has an associated source which indicates whether a contributor rated a note after receiving a randomized notification where they were specifically asked to rate a particular note – these are considered population-sampled – or whether they discovered the note some other way (e.g. maybe they saw a proposed note on their For You page, or followed a link directly to the note, or found the note on one of the [timeline tabs](../under-the-hood/timeline-tabs.md) like "Needs your help" or "New").
+
+Then, for any note scored by the core model with at least 8 population-sampled ratings, a separate matrix factorization is run on just the population-sampled ratings, where we learn the note's population-sampled intercept score $i_{n}^{pop}$. If a note was otherwise going to be Currently Rated Helpful based on self-selected (default) raters, it will be filtered (assigned "Needs More Ratings" status) if:
+
+- The note's core population-sampled intercept is at least 0.15 less than the note's default core intercept ($i_{n}^{pop} < i_{n} - 0.15$)
+- The note's core population-sampled intercept is at most 0.3 ($i_{n}^{pop} <= 0.3$)
+- The note received at least 8 total population-sampled ratings from raters above the helpfulness score threshold, including at least two ratings from raters with $f_{u} < 0$ and at least two ratings from raters with $f_{u} > 0$.
+
+
 ## Tag Outlier Filtering
 
 In some cases, a note may appear helpful but miss key points about the tweet or lack sources.
-Reviewers who rate a note as "Not Helpful" can associate [tag](../contributing/examples.md) with their review to identify specific shortcomings of the note.
+Reviewers who rate a note as "Not Helpful" can associate [tags](../contributing/examples.md) with their review to identify specific shortcomings of the note.
 When a note has receives high levels of a "Not Helpful" tag, we require a higher intercept before rating the note as "Helpful".
 This approach helps us to maintain data quality by recognizing when there is a troubling pattern on an otherwise strong note.
 
@@ -332,6 +345,20 @@ $$
 Combined with the regularization adjustments from the first round, the added weighting functions to improve the learned user representation, ultimately allowing the model to recognize more instances of consensus among users that hold different perspectives.
 We have deployed the expanded consensus trial algorithm in Group Model 14 and plan to expand deployment as we evaluate performance in the initial trial.
 
+## Gaussian Model
+
+To help surface as many helpful notes as possible, beginning November 10 2025, we are piloting a new final note scoring aggregation mechanism that estimates community consensus across our rater base.
+
+The new aggregation is a numerical approximation of the continuous geometric mean of helpfulness rates across the rater factor spectrum. This approximation evaluates the helpfulness rate at a series of points on the rater factor spectrum and takes the geometric mean of those values. For example, if one chose to use only 2 points, one representing factors < 0 and one representing factors > 0, the calculation would be $\sqrt{helpfulness_{<0} * helpfulness_{>0}}$. The current aggregation uses 25 points on each side, with the points chosen such that an approximately equal proportion of the rater population falls into the bin centered at each point.
+
+To avoid sensitivity to low numbers of votes in certain buckets and instability related to bucket edges, the aggregation uses Gaussian kernel smoothing to distribute the weight of users’ votes among several points in the vicinity. Each user rating retains the same total weight, but at any given evaluation point the helpfulness rate may be determined by the average of many ratings weighted by their distance from the evaluation point, even if those ratings lie in a different bin than the evaluation point.
+
+Additionally, the scorer applies a prior at all points. This prior considers the dot product of the evaluation point and the estimated note factor, such that notes with a high magnitude factor are assumed to be disliked by raters with an opposing factor until proven otherwise. The overall prior used is $min(.4, max(f_n * f_{point}, .05))$. 
+
+Finally, Not Helpful ratings are overweighted to reflect both their disproportionately low base rate in the data and a high quality bar.
+
+Notes that earn Helpful status via this new aggregation technique are currently shown experimentally to a percentage of viewers to gather ratings and inform improvements. Their status will be marked as decided by `GaussianModel`.
+
 ## Status Stabilization
 
 As Community Notes has scaled from inception to global availability we've seen an increasing number of notes and ratings spanning a widening array of topics.
@@ -399,11 +426,18 @@ For not-helpful notes:
     - Re-fit the matrix factorization model on ratings data that’s been filtered by user helpfulness scores in step 3.
     - Fit the note diligence matrix factorization model.
     - Compute upper and lower confidence bounds on each note's intercept by adding pseudo-ratings and re-fitting the model with them.
+    - For the experimental GaussianModel, compute scores using approach described in relevant section above
 3. Reconcile scoring results from each scorer to generate final status for each note.
 4. Update status labels for any notes written within the last two weeks based the intercept terms (scores) and rating tags.  Stabilize helpfulness status for any notes older than two weeks.
 5. Assign the top two explanation tags that match the note’s final status label as in [Determining Note Status Explanation Tags](#determining-note-status-explanation-tags), or if two such tags don’t exist, then revert the note status label to “Needs More Ratings”.
 
 ## What’s New?
+
+**Nov 10, 2025**
+- Introduce new Gaussian model to final scoring, testing new aggregation to identify additional helpful notes.
+
+**Sep 30, 2025**
+- Introduce population sample filtering.
 
 **June 30, 2025**
 - Introduce baseline rater independence intercept to check for consensus across independent raters.

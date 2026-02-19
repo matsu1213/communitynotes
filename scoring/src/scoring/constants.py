@@ -80,8 +80,101 @@ correlatedRaterKey = "correlatedRater"
 
 # Scoring Groups
 coreGroups: Set[int] = {1, 2, 3, 6, 8, 9, 10, 11, 13, 14, 19, 21, 25}
+coverageGroups: Set[int] = {1, 2, 3, 6, 8, 9, 10, 11, 13, 14, 19, 25}
 expansionGroups: Set[int] = {0, 4, 5, 7, 12, 15, 16, 18, 20, 22, 23, 26, 27, 28, 29, 33}
 expansionPlusGroups: Set[int] = {17, 24, 30, 31, 32}
+
+# Bins for Gaussian Scorer
+quantileRange = np.array(
+  [
+    -0.92,
+    -0.65,
+    -0.61,
+    -0.58,
+    -0.55,
+    -0.52,
+    -0.49,
+    -0.46,
+    -0.43,
+    -0.41,
+    -0.38,
+    -0.35,
+    -0.33,
+    -0.3,
+    -0.28,
+    -0.25,
+    -0.22,
+    -0.2,
+    -0.17,
+    -0.14,
+    -0.12,
+    -0.09,
+    -0.07,
+    -0.04,
+    -0.01,
+    0.01,
+    0.04,
+    0.07,
+    0.09,
+    0.12,
+    0.14,
+    0.17,
+    0.2,
+    0.22,
+    0.25,
+    0.28,
+    0.3,
+    0.33,
+    0.35,
+    0.38,
+    0.41,
+    0.43,
+    0.46,
+    0.49,
+    0.52,
+    0.55,
+    0.58,
+    0.61,
+    0.65,
+    0.92,
+  ]
+)
+
+smoothedRange = np.concatenate([quantileRange[0::2][:13], quantileRange[25::2]])
+
+
+@dataclass
+class GaussianParams:
+  bandwidth: float = 0.1
+  smoothingWeight: float = 0.4
+  smoothingValue: float = 0.35
+  adaptiveWeightBase: Optional[int] = 9
+  priorFactor: bool = True
+  negWeight: float = 1.75
+  minPrior: Optional[float] = 0.2
+  weightLim: float = 1e-9
+  somewhatHelpfulValue: float = 0.7
+  clipLower: float = 0.05
+  clipUpper: float = 0.8
+  flip: bool = False
+  normalize: bool = True
+
+
+gaussianCrhParams = GaussianParams()
+
+gaussianCrnhParams = GaussianParams(
+  smoothingWeight=5.0,
+  smoothingValue=0.35,
+  bandwidth=0.2,
+  minPrior=0.3,
+  adaptiveWeightBase=9,
+  negWeight=1.25,
+  flip=True,
+  clipUpper=0.65,
+  clipLower=0.25,
+  normalize=False,
+  weightLim=5e-4,
+)
 
 # TSV Values
 notHelpfulValueTsv = "NOT_HELPFUL"
@@ -89,6 +182,10 @@ somewhatHelpfulValueTsv = "SOMEWHAT_HELPFUL"
 helpfulValueTsv = "HELPFUL"
 notesSaysTweetIsMisleadingKey = "MISINFORMED_OR_POTENTIALLY_MISLEADING"
 noteSaysTweetIsNotMisleadingKey = "NOT_MISLEADING"
+
+# Rating Source Bucketed Values
+ratingSourceDefaultValueTsv = "DEFAULT"
+ratingSourcePopulationSampledValueTsv = "POPULATION_SAMPLED"
 
 # Fields Transformed From the Raw Data
 helpfulNumKey = "helpfulNum"
@@ -147,6 +244,11 @@ internalActiveRulesKey = "internalActiveRules"
 internalRaterReputationKey = "internalRaterReputation"
 internalNoteInterceptNoHighVolKey = "internalNoteInterceptNoHighVol"
 internalNoteInterceptNoCorrelatedKey = "internalNoteInterceptNoCorrelated"
+internalNoteInterceptPopulationSampledKey = "internalNoteInterceptPopulationSampled"
+
+# First Round MF Rater Scores (from prescoring)
+internalFirstRoundRaterInterceptKey = "internalFirstRoundRaterIntercept"
+internalFirstRoundRaterFactor1Key = "internalFirstRoundRaterFactor1"
 
 scorerNameKey = "scorerName"
 
@@ -175,6 +277,9 @@ coreNoteInterceptMinKey = "coreNoteInterceptMin"
 coreNumFinalRoundRatingsKey = "coreNumFinalRoundRatings"
 coreNoteInterceptNoHighVolKey = "coreNoteInterceptNoHighVol"
 coreNoteInterceptNoCorrelatedKey = "coreNoteInterceptNoCorrelated"
+coreNoteInterceptPopulationSampledKey = "coreNoteInterceptPopulationSampled"
+coreFirstRoundRaterInterceptKey = "coreFirstRoundRaterIntercept"
+coreFirstRoundRaterFactor1Key = "coreFirstRoundRaterFactor1"
 # Core No Topic Model
 coreWithTopicsNoteInterceptKey = "coreWithTopicsNoteIntercept"
 coreWithTopicsNoteFactor1Key = "coreWithTopicsNoteFactor1"
@@ -247,6 +352,15 @@ topicInternalActiveRulesKey = "topicActiveRules"
 topicNumFinalRoundRatingsKey = "topicNumFinalRoundRatings"
 topicNoteInterceptNoHighVolKey = "topicNoteInterceptNoHighVol"
 topicNoteInterceptNoCorrelatedKey = "topicNoteInterceptNoCorrelated"
+# Gaussian Model
+gaussianNoteInterceptKey = "gaussianNoteIntercept"
+gaussianNoteFactor1Key = "gaussianNoteFactor1"
+gaussianRatingStatusKey = "gaussianRatingStatus"
+gaussianActiveRulesKey = "gaussianActiveRules"
+gaussianNumFinalRoundRatingsKey = "gaussianNumFinalRoundRatings"
+gaussianNoteInterceptNoHighVolKey = "gaussianNoteInterceptNoHighVol"
+gaussianNoteInterceptNoCorrelatedKey = "gaussianNoteInterceptNoCorrelated"
+gaussianNoteInterceptPopulationSampledKey = "gaussianNoteInterceptPopulationSampled"
 # Harassment/Abuse Tag
 harassmentNoteInterceptKey = "harassmentNoteIntercept"
 harassmentNoteFactor1Key = "harassmentNoteFactor1"
@@ -265,6 +379,7 @@ noteCountKey = "noteCount"
 ratingCountKey = "ratingCount"
 numRatingsKey = "numRatings"
 numRatingsLast28DaysKey = "numRatingsLast28"
+numPopulationSampledRatingsKey = "numPopulationSampledRatings"
 ratingFromInitialModelingGroupKey = "ratingFromInitialModelingGroup"
 percentFromInitialModelingGroupKey = "percentFromInitialModelingGroup"
 numFinalRoundRatingsKey = "numFinalRoundRatings"
@@ -383,6 +498,13 @@ notHelpfulTagsAdjustedRatioTSVColumnsAndTypes = [
 ]
 ratingWeightKey = "ratingWeight"
 
+# Common substrings used for column name filtering
+noteInterceptMinSubstring = "NoteInterceptMin"
+noteInterceptMaxSubstring = "NoteInterceptMax"
+noHighVolSubstring = "NoHighVol"
+noCorrelatedSubstring = "NoCorrelated"
+populationSampledSubstring = "PopulationSampled"
+
 incorrectTagRatingsMadeByRaterKey = "incorrectTagRatingsMadeByRater"
 totalRatingsMadeByRaterKey = "totalRatingsMadeByRater"
 
@@ -462,6 +584,7 @@ harmfulKey = "harmful"
 validationDifficultyKey = "validationDifficulty"
 trustworthySourcesKey = "trustworthySources"
 isMediaNoteKey = "isMediaNote"
+isCollaborativeNoteKey = "isCollaborativeNote"
 
 noteTSVColumnsAndTypes = (
   [
@@ -480,6 +603,7 @@ noteTSVColumnsAndTypes = (
     (trustworthySourcesKey, pd.Int8Dtype()),
     (summaryKey, object),
     (isMediaNoteKey, pd.Int8Dtype()),
+    (isCollaborativeNoteKey, pd.Int8Dtype()),
   ]
 )
 noteTSVColumns = [col for (col, dtype) in noteTSVColumnsAndTypes]
@@ -490,6 +614,7 @@ versionKey = "version"
 agreeKey = "agree"
 disagreeKey = "disagree"
 ratedOnTweetIdKey = "ratedOnTweetId"
+ratingSourceBucketedKey = "ratingSourceBucketed"
 ratingTSVColumnsAndTypes = (
   [
     (noteIdKey, np.int64),
@@ -504,7 +629,7 @@ ratingTSVColumnsAndTypes = (
   ]
   + helpfulTagBoolsAndTypesTSVOrder
   + notHelpfulTagsAndTypesTSVOrder
-  + [(ratedOnTweetIdKey, np.int64)]
+  + [(ratedOnTweetIdKey, np.int64), (ratingSourceBucketedKey, "category")]
 )
 
 ratingTSVColumns = [col for (col, dtype) in ratingTSVColumnsAndTypes]
@@ -647,6 +772,14 @@ maxSignCountKey = "maxSignCount"
 netMinHelpfulKey = "netMinHelpful"
 netMinHelpfulRatioKey = "netMinHelpfulRatio"
 
+# Population sampled per-sign counts
+negFactorPopulationSampledRatingCountKey = "negFactor_populationSampledRatingCount"
+posFactorPopulationSampledRatingCountKey = "posFactor_populationSampledRatingCount"
+
+# Core population sampled per-sign counts
+coreNegFactorPopulationSampledRatingCountKey = "coreNegFactor_populationSampledRatingCount"
+corePosFactorPopulationSampledRatingCountKey = "corePosFactor_populationSampledRatingCount"
+
 noteParameterUncertaintyTSVAuxColumnsAndTypes = [
   ("internalNoteFactor1_max", np.double),
   ("internalNoteFactor1_median", np.double),
@@ -685,6 +818,7 @@ auxiliaryScoredNotesTSVColumnsAndTypes = (
     (noteAuthorParticipantIdKey, object),
     (awaitingMoreRatingsBoolKey, np.int8),
     (numRatingsLast28DaysKey, np.int64),
+    (numPopulationSampledRatingsKey, np.int64),
     (currentLabelKey, str),
     (currentlyRatedHelpfulBoolKey, np.int8),
     (currentlyRatedNotHelpfulBoolKey, np.int8),
@@ -696,6 +830,10 @@ auxiliaryScoredNotesTSVColumnsAndTypes = (
   + notHelpfulTagsAdjustedTSVColumnsAndTypes
   + notHelpfulTagsAdjustedRatioTSVColumnsAndTypes
   + incorrectFilterColumnsAndTypes
+  + [
+    (coreNegFactorPopulationSampledRatingCountKey, np.int64),
+    (corePosFactorPopulationSampledRatingCountKey, np.int64),
+  ]
 )
 auxiliaryScoredNotesTSVColumns = [col for (col, dtype) in auxiliaryScoredNotesTSVColumnsAndTypes]
 auxiliaryScoredNotesTSVTypeMapping = {
@@ -807,12 +945,21 @@ noteModelOutputTSVColumnsAndTypes = [
   (multiGroupNoteInterceptNoHighVolKey, "category"),
   (topicNoteInterceptNoHighVolKey, "category"),
   (coreNoteInterceptNoCorrelatedKey, "category"),
+  (coreNoteInterceptPopulationSampledKey, np.double),
   (coreWithTopicsNoteInterceptNoCorrelatedKey, "category"),
   (expansionNoteInterceptNoCorrelatedKey, "category"),
   (expansionPlusNoteInterceptNoCorrelatedKey, "category"),
   (groupNoteInterceptNoCorrelatedKey, "category"),
   (multiGroupNoteInterceptNoCorrelatedKey, "category"),
   (topicNoteInterceptNoCorrelatedKey, "category"),
+  (gaussianNoteInterceptKey, np.double),
+  (gaussianNoteFactor1Key, np.double),
+  (gaussianRatingStatusKey, "category"),
+  (gaussianActiveRulesKey, "category"),
+  (gaussianNoteInterceptNoCorrelatedKey, np.double),
+  (gaussianNoteInterceptNoHighVolKey, np.double),
+  (gaussianNoteInterceptPopulationSampledKey, np.double),
+  (gaussianNumFinalRoundRatingsKey, np.double),  # double because nullable.
 ]
 noteModelOutputTSVColumns = [col for (col, dtype) in noteModelOutputTSVColumnsAndTypes]
 noteModelOutputTSVTypeMapping = {col: dtype for (col, dtype) in noteModelOutputTSVColumnsAndTypes}
@@ -829,6 +976,8 @@ prescoringRaterModelOutputTSVColumnsAndTypes = [
   (raterParticipantIdKey, object),
   (internalRaterInterceptKey, np.double),
   (internalRaterFactor1Key, np.double),
+  (internalFirstRoundRaterInterceptKey, np.double),
+  (internalFirstRoundRaterFactor1Key, np.double),
   (crhCrnhRatioDifferenceKey, np.double),
   (meanNoteScoreKey, np.double),
   (raterAgreeRatioKey, np.double),
@@ -898,6 +1047,8 @@ raterModelOutputTSVColumnsAndTypes = [
   (modelingMultiGroupKey, np.float64),
   (coreWithTopicsRaterInterceptKey, np.double),
   (coreWithTopicsRaterFactor1Key, np.double),
+  (coreFirstRoundRaterInterceptKey, np.double),
+  (coreFirstRoundRaterFactor1Key, np.double),
 ]
 raterModelOutputTSVColumns = [col for (col, dtype) in raterModelOutputTSVColumnsAndTypes]
 raterModelOutputTSVTypeMapping = {col: dtype for (col, dtype) in raterModelOutputTSVColumnsAndTypes}
@@ -915,7 +1066,10 @@ noteStatusChangesDerivedColumnsAndTypes = [
 noteStatusChangesRemovedCols = [
   col
   for col in noteModelOutputTSVColumns
-  if ("NoteInterceptMin" in col) or ("NoteInterceptMax" in col)
+  if (noteInterceptMinSubstring in col)
+  or (noteInterceptMaxSubstring in col)
+  or (noHighVolSubstring in col)
+  or (noCorrelatedSubstring in col)
 ]
 noteStatusChangesModelOutputColumnsAndTypes = [
   (col, t)
@@ -1029,6 +1183,7 @@ class FinalScoringArgs(ScoringArgs):
   prescoringNoteModelOutput: pd.DataFrame
   prescoringRaterModelOutput: pd.DataFrame
   prescoringMetaOutput: PrescoringMetaOutput
+  empiricalTotals: Optional[pd.DataFrame]
 
   def remove_large_args_for_multiprocessing(self):
     self.ratings = None

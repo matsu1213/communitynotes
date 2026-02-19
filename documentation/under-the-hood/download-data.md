@@ -23,7 +23,7 @@ The [Community Notes data](https://x.com/i/communitynotes/download-data) is rele
 - **Ratings:** Contains a table representing all ratings
 - **Note Status History:** Contains a table with metadata about notes including what statuses they received and when.
 - **User Enrollment:** Contains a table with metadata about each user's enrollment state.
-- **Note Requests:** Contains a table representing all requests for a Community Note, which can be submitted by any account on X.
+- **Note Requests:** Contains a table representing all [Requests for a Community Note](./note-requests.md) shown to contributors, which can be submitted by any account on X.
 
 Note-related tables can be joined on the noteId field to create a combined dataset with information about users, notes, and their ratings. The data is released in separate tables/files to reduce the dataset size by avoiding data duplication (this is known as a normalized data model).
 
@@ -42,6 +42,20 @@ Each data snapshot table is stored in tsv (tab-separated values) file format wit
 As we iterate and improve Community Notes, we will occasionally make changes to the questions we ask contributors in the note writing and note rating forms, or additional metadata shared about notes and rating. When we do this, some question fields / columns in our public data will be deprecated (no longer populated), and others will be added. Below we will keep a change log of changes we have made to the contribution form questions and other updates we have made to the data, as well as when those changes were made.
 
 {% accordionSection %}
+
+{% accordionItem title="2026-02-04 - New columns for Collaborative Notes"  %}
+
+- We’ve updated the open-source notes dataset to add a new boolean, `isCollaborativeNote`, to indicate whether the note is a collaborative or regular note.
+- We've also added a new `suggestion` string field to the open-source ratings dataset, which contains user-entered text suggestions (on collaborative notes).
+
+{% /accordionItem %}
+
+{% accordionItem title="2026-01-12 - Updated Note Request dataset"  %}
+
+- We’ve updated the open-source note request dataset to include posts that either had note requests [showing in-app](./note-requests.md), or were made available via the [AI Note Writer API](../api/overview.md).
+
+{% /accordionItem %}
+
 {% accordionItem title="2025-05-20 - New User Request dataset "  %}
 
 - New dataset with “Requests for a Community Note.” Anyone on X can make a request. As of January 22, 2025, people can also include a link to a source (in the form of an X post) in their request. [More details](./note-requests.md)
@@ -137,6 +151,7 @@ As we iterate and improve Community Notes, we will occasionally make changes to 
 | `trustworthySources` | Int | Binary indicator, based on user-entered multiple choice in response to note writing question “Did you link to sources you believe most people would consider trustworthy?” | 1 if “Yes” is selected, 0 if “No” is selected |
 | `summary` | String | User-entered text, in response to the note writing prompt “Please explain the evidence behind your choices, to help others who see this tweet understand why it is not misleading” | User entered text explanation, with some characters escaped (e.g. tabs converted to spaces). |
 | `isMediaNote` | Int | User-entered checkbox in response to question “Is your note about the Tweet or the image?”. _New as of 2023-05-24_. | 1 if “About the image in this Tweet, and should appear on all Tweets that include this image” is selected, and 0 otherwise (including both if "About this specific Tweet" is selected instead, or by default, e.g. if the note was written on a Tweet without media). |
+| `isCollaborativeNote` | Int | Binary indicator indicating if the note is a collaborative note. _New as of 2026-02-04_ | 1 if the note is a collaborative note. 0 if the note is a regular note (default).
 
 ### Note Status History
 
@@ -204,6 +219,8 @@ As we iterate and improve Community Notes, we will occasionally make changes to 
 | `notHelpfulOpinionSpeculation`           | Int    | User-entered checkbox in response to prompt “What was unhelpful about it?” (Check all that apply question type). New as of 2021-12-15                                                                               | 1 if “Opinion or speculation” is selected, else 0.               |
 | `notHelpfulNoteNotNeeded`                | Int    | User-entered checkbox in response to prompt “What was unhelpful about it?” (Check all that apply question type). New as of 2021-12-15                                                                               | 1 if “Note not needed on this Tweet” is selected, else 0.        |
 | `ratedOnTweetId`                         | Long   | The unique ID of the Tweet that the note was rated on (which, in the case of media notes, may not be the same Tweet as the note was originally written on). _New as of 2023-05-24_.                                 |
+| `ratingSourceBucketed`                         | String   | The source of the rating (ratings are population-sampled only if they are made in response to a "Needs Your Help" notification).  _New as of 2025-09-30_.                                 | "DEFAULT", "POPULATION_SAMPLED"
+| `suggestion`                         | String   | User-entered suggestion string (for collaborative notes).  _New as of 2026-02-04_.                                 | 
 
 ### User Enrollment
 
@@ -221,7 +238,9 @@ As we iterate and improve Community Notes, we will occasionally make changes to 
 
 | Field                                 | Type   | Description                                                                                                                                                                                                                                                                                                                                                                                           | Response values                                                                |
 | ------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `userId`|String|A hashed user identifier of the user who requested a note. This id remains stable even if the user changes their username/handle.||
-| `tweetId`|Long|The tweetId number for the post on which the user is requesting a note.||
-| `createdAtMillis`|Long|Time the note was created, in milliseconds since epoch (UTC).||
-| `sourceLink`|String|A link to an X post, which note requestors are optionally allowed to include as of January 22, 2025.|User-entered X post URL. Can be empty if not included.|
+| `tweetId`|Long|The tweetId for the post on which a note request has appeared (either in-product UX or via the AI Note Writer API).||
+| `sourceLinks`|Array|A list of links to X posts, which note requestors are optionally allowed to include as of January 22, 2025.|Array like `[“url1”, url2”]` containing user-entered X post URL. Can be empty if none included.|
+| `noteRequestFeedEligibleTimestamp`|Long|Time in milliseconds since epoch (UTC) that note requests met criteria to be shown to contributors in-app on the post, in milliseconds since epoch (UTC). Note that there might be [additional constraints](https://communitynotes.x.com/guide/en/under-the-hood/note-requests) on when these will show (e.g. only within N hours after post is created, and only for M hours after the request starts showing).|-1 if tweetId never appears on this request feed|
+| `apiSmallFeedEligibleTimestamp`|Long|Time in milliseconds since epoch (UTC) that note requests met criteria to be returned via the AI Note Writing API’s `posts_eligible_for_notes` [endpoint](https://docs.x.com/x-api/community-notes/search-for-posts-eligible-for-community-notes) with `'feed_size: small'`. Note that there might be additional constraints on when these are returned in the posts_eligible_for_notes endpoint (e.g. only for certain languages during API pilot).|-1 if tweetId never appears on this request feed|
+| `apiLargeFeedEligibleTimestamp`|Long|Time in milliseconds since epoch (UTC) that note requests met criteria to be returned via the AI Note Writing API’s `posts_eligible_for_notes` [endpoint](https://docs.x.com/x-api/community-notes/search-for-posts-eligible-for-community-notes) with `'feed_size: large'`. Note that there might be additional constraints on when these are returned in the posts_eligible_for_notes endpoint (e.g. only for certain languages during API pilot).|-1 if tweetId never appears on this request feed|
+| `apiXlFeedEligibleTimestamp`|Long|Time in milliseconds since epoch (UTC) that note requests met criteria to be returned via the AI Note Writing API's `posts_eligible_for_notes` [endpoint](https://docs.x.com/x-api/community-notes/search-for-posts-eligible-for-community-notes) with `'feed_size: xl'`. Note that there might be additional constraints on when these are returned in the posts_eligible_for_notes endpoint (e.g. only for certain languages during API pilot).|-1 if tweetId never appears on this request feed|
